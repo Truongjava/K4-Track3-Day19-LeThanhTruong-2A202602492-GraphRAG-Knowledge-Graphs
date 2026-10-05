@@ -20,6 +20,8 @@ from typing import Any
 PROVIDERS = {
     "openai": {"key": "OPENAI_API_KEY", "base_url": None,
                "chat": "gpt-4o-mini", "embed": "text-embedding-3-small"},
+    "aibox": {"key": "AIBOX_API_KEY", "base_url": "https://api.ai-box.vn/v1",
+              "chat": "qwen3.7-flash", "embed": "qwen3.7-text-embedding"},
     "openrouter": {"key": "OPENROUTER_API_KEY", "base_url": "https://openrouter.ai/api/v1",
                    "chat": "openai/gpt-4o-mini", "embed": "openai/text-embedding-3-small"},
     "gemini": {"key": "GEMINI_API_KEY", "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
@@ -27,7 +29,11 @@ PROVIDERS = {
     "anthropic": {"key": "ANTHROPIC_API_KEY", "base_url": None,
                   "chat": "claude-opus-5-5", "embed": None},
 }
-PROVIDER_ORDER = ["openai", "openrouter", "gemini", "anthropic"]
+PROVIDER_ORDER = ["openai", "aibox", "openrouter", "gemini", "anthropic"]
+
+# Gateway-specific request-body extras. ai-box serves only reasoning models: without
+# enable_thinking=False every qwen3.x call spends ~2.5k reasoning tokens and 8x the wall-clock.
+EXTRA_BODY = {"aibox": {"enable_thinking": False}}
 
 # USD per 1M tokens (input, output). Check each provider's pricing page before reporting real numbers.
 PRICES_PER_M = {
@@ -41,6 +47,12 @@ PRICES_PER_M = {
     "claude-opus-5-5": (4.00, 20.00),
     "claude-sonnet-5-5": (2.00, 10.00),
     "claude-haiku-4-5": (1.00, 5.00),
+    # ai-box publishes no rate card page, but GET /api/pricing returns one-api `model_ratio` +
+    # `completion_ratio` per model. In that convention ratio 1.0 = $2 per 1M tokens, so
+    # input = ratio * 2 and output = ratio * completion_ratio * 2. Derived, not invoiced —
+    # the ratios below are what the gateway itself reports for these two models.
+    "qwen3.7-flash": (0.02, 0.08),            # model_ratio 0.01,  completion_ratio 4
+    "qwen3.7-text-embedding": (0.014, 0.0),   # model_ratio 0.007, embeddings have no output
 }
 
 @dataclass
@@ -119,19 +131,11 @@ class MeteredLLM:
         if self.chat_provider == "anthropic":
             text, model, tokens_in, tokens_out = self._chat_anthropic(prompt)
         else:
+            body = {"model": self.chat_model_id, "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0, "extra_body": EXTRA_BODY.get(self.chat_provider)}
             if json_mode and self.chat_provider != "gemini":
-                response = self._chat_client.chat.completions.create(
-                    model=self.chat_model_id,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0,
-                    response_format={"type": "json_object"},
-                )
-            else:
-                response = self._chat_client.chat.completions.create(
-                    model=self.chat_model_id,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0,
-                )
+                body["response_format"] = {"type": "json_object"}
+            response = self._chat_client.chat.completions.create(**body)
             text, model = response.choices[0].message.content or "", self.chat_model_id
             usage = response.usage
             tokens_in = usage.prompt_tokens if usage else 0
